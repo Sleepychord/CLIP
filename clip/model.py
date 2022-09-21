@@ -65,10 +65,41 @@ class AttentionPool2d(nn.Module):
         self.c_proj = nn.Linear(embed_dim, output_dim or embed_dim)
         self.num_heads = num_heads
 
-    def forward(self, x):
+    def forward(self, x, output_features=False):
         x = x.flatten(start_dim=2).permute(2, 0, 1)  # NCHW -> (HW)NC
+        x_uncat = x
         x = torch.cat([x.mean(dim=0, keepdim=True), x], dim=0)  # (HW+1)NC
-        x = x + self.positional_embedding[:, None, :].to(x.dtype)  # (HW+1)NC
+        x_unpos = x
+        if x.shape[0] == self.positional_embedding.shape[0]:
+            x = x + self.positional_embedding[:, None, :].to(x.dtype)  # (HW+1)NC
+        else:
+            # assert output_features
+            print('Warning: Change resolution! The pooled result might not reliable.')
+        attn_mask = torch.eye(x.shape[0], device=x.device, dtype=torch.bool)
+        attn_mask[0, :] = True
+        if output_features:
+            # y, _attn = F.multi_head_attention_forward(
+            #     query=x, key=x, value=x_unpos,
+            #     embed_dim_to_check=x.shape[-1],
+            #     num_heads=self.num_heads,
+            #     q_proj_weight=self.q_proj.weight,
+            #     k_proj_weight=self.k_proj.weight,
+            #     v_proj_weight=self.v_proj.weight,
+            #     in_proj_weight=None,
+            #     in_proj_bias=torch.cat([self.q_proj.bias, self.k_proj.bias, self.v_proj.bias]),
+            #     bias_k=None,
+            #     bias_v=None,
+            #     add_zero_attn=False,
+            #     dropout_p=0,
+            #     out_proj_weight=self.c_proj.weight,
+            #     out_proj_bias=self.c_proj.bias,
+            #     use_separate_proj_weight=True,
+            #     training=self.training,
+            #     need_weights=False,
+            #     attn_mask=~attn_mask # NOT
+            # ) # (HW+1)NC
+            # return y[0], y[1:].permute(1, 0, 2) # N(HW)C
+            y = self.c_proj(self.v_proj(x_uncat)).permute(1, 0, 2)
         x, _ = F.multi_head_attention_forward(
             query=x[:1], key=x, value=x,
             embed_dim_to_check=x.shape[-1],
@@ -88,6 +119,8 @@ class AttentionPool2d(nn.Module):
             training=self.training,
             need_weights=False
         )
+        if output_features:
+            return x.squeeze(0), y
         return x.squeeze(0)
 
 
@@ -135,7 +168,7 @@ class ModifiedResNet(nn.Module):
 
         return nn.Sequential(*layers)
 
-    def forward(self, x):
+    def forward(self, x, output_features=False):
         def stem(x):
             x = self.relu1(self.bn1(self.conv1(x)))
             x = self.relu2(self.bn2(self.conv2(x)))
@@ -149,7 +182,7 @@ class ModifiedResNet(nn.Module):
         x = self.layer2(x)
         x = self.layer3(x)
         x = self.layer4(x)
-        x = self.attnpool(x)
+        x = self.attnpool(x, output_features=output_features)
 
         return x
 
@@ -220,7 +253,7 @@ class VisionTransformer(nn.Module):
         self.ln_post = LayerNorm(width)
         self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, output_features=False):
         x = self.conv1(x)  # shape = [*, width, grid, grid]
         x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
         x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
@@ -232,10 +265,18 @@ class VisionTransformer(nn.Module):
         x = self.transformer(x)
         x = x.permute(1, 0, 2)  # LND -> NLD
 
+        if output_features:
+            y = self.ln_post(x[:, 1:, :])
+            if self.proj is not None:
+                y = y @ self.proj
+
         x = self.ln_post(x[:, 0, :])
 
         if self.proj is not None:
-            x = x @ self.proj
+            x = x @ self.proj   
+
+        if output_features:
+            return x, y
 
         return x
 
@@ -337,8 +378,8 @@ class CLIP(nn.Module):
     def dtype(self):
         return self.visual.conv1.weight.dtype
 
-    def encode_image(self, image):
-        return self.visual(image.type(self.dtype))
+    def encode_image(self, image, output_features=False):
+        return self.visual(image.type(self.dtype), output_features=output_features)
 
     def encode_text(self, text):
         x = self.token_embedding(text).type(self.dtype)  # [batch_size, n_ctx, d_model]
