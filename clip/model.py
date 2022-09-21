@@ -215,12 +215,16 @@ class ResidualAttentionBlock(nn.Module):
         self.ln_2 = LayerNorm(d_model)
         self.attn_mask = attn_mask
 
-    def attention(self, x: torch.Tensor):
-        self.attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask is not None else None
-        return self.attn(x, x, x, need_weights=False, attn_mask=self.attn_mask)[0]
+    def attention(self, x: torch.Tensor, attn_mask=None):
+        if attn_mask is not None:
+            attn_mask = attn_mask.to(dtype=x.dtype, device=x.device)
+        elif self.attn_mask is not None:
+            self.attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device)
+            attn_mask = self.attn_mask
+        return self.attn(x, x, x, need_weights=False, attn_mask=attn_mask)[0]
 
-    def forward(self, x: torch.Tensor):
-        x = x + self.attention(self.ln_1(x))
+    def forward(self, x: torch.Tensor, attn_mask=None):
+        x = x + self.attention(self.ln_1(x), attn_mask=attn_mask)
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -230,10 +234,36 @@ class Transformer(nn.Module):
         super().__init__()
         self.width = width
         self.layers = layers
-        self.resblocks = nn.Sequential(*[ResidualAttentionBlock(width, heads, attn_mask) for _ in range(layers)])
+        self.resblocks = nn.Sequential(
+            *[
+                ResidualAttentionBlock(width, heads, attn_mask) 
+                for _ in range(layers)
+            ]
+            )
 
     def forward(self, x: torch.Tensor):
         return self.resblocks(x)
+
+class TransformerFixFinal(nn.Module):
+    def __init__(self, width: int, layers: int, heads: int, attn_mask: torch.Tensor = None, final_attn_mask = None):
+        super().__init__()
+        self.width = width
+        self.layers = layers
+        self.resblocks = nn.Sequential(
+            *[
+                ResidualAttentionBlock(width, heads, attn_mask) 
+                for _ in range(layers-1)
+            ], ResidualAttentionBlock(width, heads, final_attn_mask) 
+            )
+
+    def forward(self, x: torch.Tensor, final_attn_mask=None):
+        if final_attn_mask is None:
+            return self.resblocks(x)
+        default_final_attn_mask = self.resblocks[-1].attn_mask
+        self.resblocks[-1].attn_mask = final_attn_mask
+        ret = self.resblocks(x)
+        self.resblocks[-1].attn_mask = default_final_attn_mask
+        return ret
 
 
 class VisionTransformer(nn.Module):
@@ -248,7 +278,13 @@ class VisionTransformer(nn.Module):
         self.positional_embedding = nn.Parameter(scale * torch.randn((input_resolution // patch_size) ** 2 + 1, width))
         self.ln_pre = LayerNorm(width)
 
-        self.transformer = Transformer(width, layers, heads)
+        # self.transformer = Transformer(width, layers, heads)
+        context_length = (input_resolution // patch_size) ** 2 + 1
+        mask = torch.empty(context_length, context_length)
+        mask.fill_(float("-inf"))
+        mask.fill_diagonal_(0)  # zero out the diagonal
+        mask[0, :] = 0
+        self.transformer = TransformerFixFinal(width, layers, heads, final_attn_mask=mask)
 
         self.ln_post = LayerNorm(width)
         self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
@@ -299,6 +335,7 @@ class CLIP(nn.Module):
         super().__init__()
 
         self.context_length = context_length
+        self.transformer_heads = transformer_heads
 
         if isinstance(vision_layers, (tuple, list)):
             vision_heads = vision_width * 32 // 64
@@ -320,7 +357,7 @@ class CLIP(nn.Module):
                 output_dim=embed_dim
             )
 
-        self.transformer = Transformer(
+        self.transformer = TransformerFixFinal(
             width=transformer_width,
             layers=transformer_layers,
             heads=transformer_heads,
@@ -381,20 +418,32 @@ class CLIP(nn.Module):
     def encode_image(self, image, output_features=False):
         return self.visual(image.type(self.dtype), output_features=output_features)
 
-    def encode_text(self, text):
+    def encode_text(self, text, output_features=False):
         x = self.token_embedding(text).type(self.dtype)  # [batch_size, n_ctx, d_model]
+
+        final_attn_mask = torch.empty(x.shape[0], self.context_length, self.context_length)
+        final_attn_mask.fill_(float("-inf"))
+        eos_pos = text.argmax(dim=-1) # [batch_size]
+        for i in range(x.shape[0]):
+            final_attn_mask[i].fill_diagonal_(0)  # zero out the diagonal
+            p = eos_pos[i]
+            final_attn_mask[i, p:, :p] = 0 # [eos]s can attend to normal tokens
+        final_attn_mask = final_attn_mask.repeat_interleave(self.transformer_heads, dim=0)
 
         x = x + self.positional_embedding.type(self.dtype)
         x = x.permute(1, 0, 2)  # NLD -> LND
-        x = self.transformer(x)
+        x = self.transformer(x)#, final_attn_mask=final_attn_mask)
         x = x.permute(1, 0, 2)  # LND -> NLD
         x = self.ln_final(x).type(self.dtype)
 
         # x.shape = [batch_size, n_ctx, transformer.width]
         # take features from the eot embedding (eot_token is the highest number in each sequence)
-        x = x[torch.arange(x.shape[0]), text.argmax(dim=-1)] @ self.text_projection
+        x_ = x[torch.arange(x.shape[0]), text.argmax(dim=-1)] @ self.text_projection
 
-        return x
+        if output_features:
+            y = x @ self.text_projection
+            return x_, y, eos_pos
+        return x_
 
     def forward(self, image, text):
         image_features = self.encode_image(image)
