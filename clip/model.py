@@ -186,8 +186,8 @@ class ModifiedResNet(nn.Module):
 
         return x
 
-
-class LayerNorm(nn.LayerNorm):
+LayerNorm = nn.LayerNorm
+class LayerNorm1(nn.LayerNorm):
     """Subclass torch's LayerNorm to handle fp16."""
 
     def forward(self, x: torch.Tensor):
